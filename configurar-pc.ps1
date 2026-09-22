@@ -55,6 +55,42 @@ function Ensure-Node {
     Write-Output "  Node listo en $dest"
 }
 
+function Ensure-Gh {
+    $g = Get-Command gh -ErrorAction SilentlyContinue
+    if ($g) { return $g.Source }
+    $fb = "$env:LOCALAPPDATA\manhwa-tools\gh\gh.exe"
+    if (Test-Path $fb) {
+        $env:Path = "$env:LOCALAPPDATA\manhwa-tools\gh;" + $env:Path
+        return $fb
+    }
+    Write-Output "  Descargando gh CLI portable (para conectar tu cuenta de GitHub desde el navegador)..."
+    $ver = "2.62.0"
+    $url = "https://github.com/cli/cli/releases/download/v$ver/gh_${ver}_windows_amd64.zip"
+    $zip = Join-Path $env:TEMP "gh-$ver.zip"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        $dest = "$env:LOCALAPPDATA\manhwa-tools\gh"
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $dest -Force
+        $inner = Get-ChildItem "$dest\gh_${ver}_windows_amd64" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($inner) {
+            Get-ChildItem $inner.FullName | Move-Item -Destination $dest -Force
+            Remove-Item $inner.FullName -Recurse -Force
+        }
+        $found = Get-ChildItem $dest -Recurse -Filter "gh.exe" | Select-Object -First 1
+        if ($found) {
+            $bin = Split-Path -Parent $found.FullName
+            $env:Path = "$bin;" + $env:Path
+            [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
+            Write-Output "  gh listo en $bin"
+            return $found.FullName
+        }
+    } catch {
+        Write-Output "  (no pude descargar gh; se puede usar igual con el token)"
+    }
+    return ""
+}
+
 Write-Output "=== Preparar esta PC para trabajar con manhwaWeb ==="
 Write-Output ""
 
@@ -82,16 +118,44 @@ if (-not $git) {
 }
 
 Ensure-Node
+$ghExe = Ensure-Gh
 
 Write-Output "Git:      $git"
 $nodePath = (Get-Command node -ErrorAction SilentlyContinue) | ForEach-Object { $_.Source }
 Write-Output "Node:     $(if ($nodePath) { $nodePath } else { 'no encontrado (alcanza con git para publicar)' })"
+Write-Output "gh:       $(if ($ghExe) { $ghExe } else { 'no disponible' })"
 Write-Output ""
 
 if (-not $Token) {
-    $Token = Read-Host "Token de GitHub (de https://github.com/settings/tokens)"
+    $ghTok = ""
+    if ($ghExe) { $ghTok = & $ghExe auth token 2>$null | Out-String; $ghTok = $ghTok.Trim() }
+    if ($ghTok) {
+        Write-Output "Encontré tu sesión de GitHub en esta PC. Usándola sin pedir nada."
+        $Token = $ghTok
+    } else {
+        Write-Output "No hay sesión de GitHub en esta PC todavía. Tenés dos opciones:"
+        if ($ghExe) {
+            Write-Output "  [1] RECOMENDADA: loguearte una vez con el navegador (te asocio tu cuenta y no pegás nada)"
+            Write-Output "  [2] Pegar el token (el mismo RELEASE_TOKEN de github.com/settings/tokens)"
+            $choice = Read-Host "Elegí 1 o 2"
+            if ($choice -eq "1") {
+                & $ghExe auth login
+                $ghTok = & $ghExe auth token 2>$null | Out-String; $ghTok = $ghTok.Trim()
+                if (-not $ghTok) { throw "El login en el navegador no se completó. Volvé a correr el script y elegí pegar el token." }
+                $Token = $ghTok
+            } else {
+                $Token = Read-Host "Token de GitHub (de https://github.com/settings/tokens)"
+            }
+        } else {
+            $Token = Read-Host "Token de GitHub (de https://github.com/settings/tokens)"
+        }
+        if (-not $Token) { throw "El token no puede estar vacío." }
+    }
+} else {
+    if ($ghExe) {
+        try { $Token | & $ghExe auth login --with-token 2>$null } catch { }
+    }
 }
-if (-not $Token) { throw "El token no puede estar vacío." }
 
 if (-not $Dir) { $Dir = Join-Path $env:USERPROFILE "manhwaWeb-app" }
 
@@ -107,7 +171,7 @@ if (-not $isRepo) {
     if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     Write-Output "Clonando repositorio privado en $Dir ..."
     & $git clone "https://$Name`:$Token@github.com/Arloos01/manhwaWeb-app.git" $Dir
-    if ($LASTEXITCODE -ne 0) { throw "El clon falló. Revisá el token (debe tener permiso 'repo')." }
+    if ($LASTEXITCODE -ne 0) { throw "El clon falló. Revisá la cuenta/token (debe tener permiso 'repo')." }
     & $git -C $Dir remote set-url origin "https://github.com/Arloos01/manhwaWeb-app.git"
 } else {
     Write-Output "El repo ya está en $Dir. Sincronizando con GitHub (pull)..."
@@ -137,14 +201,8 @@ if (Test-Path $credFile) {
 
 Write-Output "Verificando conexión a GitHub..."
 & $git -C $Dir ls-remote origin HEAD | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "No pude autenticarme contra GitHub. Revisá el token." }
+if ($LASTEXITCODE -ne 0) { throw "No pude autenticarme contra GitHub. Revisá la cuenta/token." }
 Write-Output "  Conectado correctamente."
-
-$gh = Get-Command gh -ErrorAction SilentlyContinue
-if ($gh) {
-    Write-Output "gh detectado: autenticando también gh CLI..."
-    $Token | gh auth login --with-token
-}
 
 $npm = Get-Command npm -ErrorAction SilentlyContinue
 if ($npm) {
@@ -162,7 +220,7 @@ if ($npm) {
 Write-Output ""
 Write-Output "Listo. Esta PC ya quedó igual que la de tu casa:"
 Write-Output "  - Repositorio sincronizado: $Dir"
-Write-Output "  - Credenciales de GitHub guardadas (guardadas en texto plano en ~/.git-credentials)"
+Write-Output "  - Credenciales de GitHub guardadas (no vuelve a preguntar)"
 Write-Output "  - La compilación del APK la hace GitHub; no hace falta Android Studio en ninguna PC."
 Write-Output ""
 Write-Output "Para publicar una actualización nueva, entrá a $Dir y corré:"
